@@ -1,0 +1,805 @@
+import logging
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    ConversationHandler,
+    CallbackContext,
+)
+import mysql.connector
+import datetime
+import time
+import threading
+
+# Настройки
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+DATABASE_HOST = "localhost"  # Or your database host
+DATABASE_USER = "your_user"
+DATABASE_PASSWORD = "your_password"
+DATABASE_NAME = "your_database"
+ADMINISTRATOR_ID = 123456789  # Replace with the actual admin ID
+
+# Состояния для ConversationHandler
+(
+    INPUT_NUMBER,
+    SET_TIMER,
+    REGISTER_CAR_MAKE,
+    REGISTER_CAR_MODEL,
+    REGISTER_CAR_YEAR,
+    REGISTER_CAR_VIN,
+    REGISTER_LAST_MAINTENANCE_DATE,
+    REGISTER_NEXT_MILEAGE,
+    REGISTER_NEXT_DATE,
+    INPUT_CURRENT_MILEAGE,
+    CONFIRM_APPOINTMENT,
+    EVALUATE_SERVICE,
+    LEAVE_WISHES,
+    ADMIN_MENU,
+    ADMIN_LIST_CLIENTS,
+    ADMIN_SET_NEXT_MAINTENANCE_MILEAGE,
+    ADMIN_SET_NEXT_MAINTENANCE_DATE,
+    ADMIN_SELECT_CLIENT,
+    ADMIN_SET_CAR_ID,
+    ADMIN_SHOW_REPAIRS,
+    ADMIN_SELECT_CAR,
+    SELECT_CAR_FOR_MILEAGE,
+) = range(23)  # Увеличиваем диапазон
+
+# Логирование
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Переменная для хранения времени таймера
+timer_interval = None
+
+
+# Инициализация базы данных
+def init_db():
+    conn = mysql.connector.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        database=DATABASE_NAME,
+    )
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,  -- Добавлено для удобства администрирования
+            first_name TEXT, -- Добавлено
+            last_name TEXT  -- Добавлено
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cars (
+            car_id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            user_id INTEGER,
+            make TEXT, -- Марка
+            model TEXT, -- Модель
+            year INTEGER, -- Год выпуска
+            vin TEXT,      -- VIN (опционально)
+            mileage INTEGER, -- Текущий пробег
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS maintenance (
+            maintenance_id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            car_id INTEGER,
+            last_maintenance_date TEXT,   -- Дата последнего ТО (YYYY-MM-DD)
+            next_maintenance_mileage INTEGER, -- ТО через пробег (если задано)
+            next_maintenance_date TEXT,    -- ТО через дату (YYYY-MM-DD, если задано)
+            last_mileage INTEGER, --пробег во время последнего ТО
+            FOREIGN KEY (car_id) REFERENCES cars(car_id)
+        )
+    """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS repairs (
+            repair_id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            car_id INTEGER,
+            repair_date TEXT,
+            description TEXT,
+            FOREIGN KEY (car_id) REFERENCES cars(car_id)
+        )
+    """
+    )
+
+    conn.commit()
+    conn.close()
+    print("Database initialized.")
+
+
+# Команда /start
+def start(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    context.user_data.clear()  # Очищаем данные пользователя при каждом старте
+    keyboard = [
+        [KeyboardButton("Зарегистрировать автомобиль")],
+        [KeyboardButton("Ввести число")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    update.message.reply_text(
+        "Привет! Выберите действие:", reply_markup=reply_markup
+    )
+    return INPUT_NUMBER  #  Можно изменить на состояние выбора действия
+
+
+# Обработка выбора действия после /start
+def input_number(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    number = update.message.text
+
+    try:
+        number = int(number)
+        # Сохраняем данные в базу данных
+        conn = mysql.connector.connect(
+            host=DATABASE_HOST,
+            user=DATABASE_USER,
+            password=DATABASE_PASSWORD,
+            database=DATABASE_NAME,
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO user_data (user_id, number, timestamp)
+            VALUES (%s, %s, %s)
+        """,
+            (user_id, number, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        conn.close()
+        update.message.reply_text(f"Число {number} сохранено!")
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректное число.")
+        return INPUT_NUMBER
+
+    return ConversationHandler.END
+
+
+# --- Регистрация автомобиля ---
+def register_car(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text("Введите марку автомобиля:")
+    return REGISTER_CAR_MAKE
+
+
+def register_car_make(update: Update, context: CallbackContext) -> int:
+    context.user_data["car_make"] = update.message.text
+    update.message.reply_text("Введите модель автомобиля:")
+    return REGISTER_CAR_MODEL
+
+
+def register_car_model(update: Update, context: CallbackContext) -> int:
+    context.user_data["car_model"] = update.message.text
+    update.message.reply_text("Введите год выпуска автомобиля:")
+    return REGISTER_CAR_YEAR
+
+
+def register_car_year(update: Update, context: CallbackContext) -> int:
+    try:
+        year = int(update.message.text)
+        context.user_data["car_year"] = year
+        update.message.reply_text("Введите VIN (необязательно, введите '-' если нет):")
+        return REGISTER_CAR_VIN
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректный год.")
+        return REGISTER_CAR_YEAR
+
+
+def register_car_vin(update: Update, context: CallbackContext) -> int:
+    vin = update.message.text
+    context.user_data["car_vin"] = vin if vin != "-" else None
+    update.message.reply_text("Введите дату последнего ТО (YYYY-MM-DD):")
+    return REGISTER_LAST_MAINTENANCE_DATE
+
+
+def register_last_maintenance_date(update: Update, context: CallbackContext) -> int:
+    try:
+        date = datetime.datetime.strptime(update.message.text, "%Y-%m-%d").date()
+        context.user_data["last_maintenance_date"] = str(date)  # Store as string
+        keyboard = [
+            [KeyboardButton("Через пробег")],
+            [KeyboardButton("Через дату")],
+            [KeyboardButton("Не знаю")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        update.message.reply_text(
+            "Когда следующее ТО?", reply_markup=reply_markup
+        )  # выбор следующего ТО, или "не знаю"
+        return REGISTER_NEXT_MILEAGE
+
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите дату в формате YYYY-MM-DD.")
+        return REGISTER_LAST_MAINTENANCE_DATE
+
+
+def register_next_mileage(update: Update, context: CallbackContext) -> int:
+    choice = update.message.text
+    if choice == "Через пробег":
+        update.message.reply_text("Введите пробег до следующего ТО (км):")
+        return ADMIN_SET_NEXT_MAINTENANCE_MILEAGE
+    elif choice == "Через дату":
+        update.message.reply_text("Введите дату следующего ТО (YYYY-MM-DD):")
+        return REGISTER_NEXT_DATE
+    elif choice == "Не знаю":
+        context.user_data["next_maintenance_mileage"] = None
+        context.user_data["next_maintenance_date"] = None
+        return save_car_data(update, context)
+
+    else:
+        update.message.reply_text("Пожалуйста, выберите из предложенных вариантов.")
+        return REGISTER_NEXT_MILEAGE
+
+
+def register_next_date(update: Update, context: CallbackContext) -> int:
+    try:
+        date = datetime.datetime.strptime(update.message.text, "%Y-%m-%d").date()
+        context.user_data["next_maintenance_date"] = str(date)  # Store as string
+        return save_car_data(update, context)
+
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите дату в формате YYYY-MM-DD.")
+        return REGISTER_NEXT_DATE
+
+
+def save_car_data(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    conn = mysql.connector.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        database=DATABASE_NAME,
+    )
+    cursor = conn.cursor()
+
+    # Check if the user exists, create if not
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+    user_exists = cursor.fetchone()
+
+    if not user_exists:
+        username = update.message.from_user.username
+        first_name = update.message.from_user.first_name
+        last_name = update.message.from_user.last_name
+        cursor.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, last_name)
+            VALUES (%s, %s, %s, %s)
+        """,
+            (user_id, username, first_name, last_name),
+        )
+
+        conn.commit()  # Commit the user creation
+
+
+    # Insert car data
+    cursor.execute(
+        """
+        INSERT INTO cars (user_id, make, model, year, vin, mileage)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """,
+        (
+            user_id,
+            context.user_data["car_make"],
+            context.user_data["car_model"],
+            context.user_data["car_year"],
+            context.user_data["car_vin"],
+            0,  # Initial mileage, user will update later
+        ),
+    )
+    conn.commit()
+
+    car_id = cursor.lastrowid  # Get the car_id
+
+    cursor.execute(
+        """
+        INSERT INTO maintenance (car_id, last_maintenance_date, next_maintenance_mileage, next_maintenance_date, last_mileage)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (
+            car_id,
+            context.user_data["last_maintenance_date"],
+            context.user_data.get("next_maintenance_mileage"),
+            context.user_data.get("next_maintenance_date"),
+            0,  # Initial mileage
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    update.message.reply_text("Данные автомобиля успешно сохранены!")
+    context.user_data.clear()  # Clear user data
+    return ConversationHandler.END
+
+
+# --- Запрос текущего пробега ---
+def current_mileage(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    
+    conn = mysql.connector.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        database=DATABASE_NAME,
+    )
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT car_id, make, model, year FROM cars WHERE user_id = %s", (user_id,)
+    )
+    cars = cursor.fetchall()
+    conn.close()
+
+    if not cars:
+        update.message.reply_text(
+            "У вас нет зарегестрированных автомобилей. Пожалуйста, зарегистрируйте сначала автомобиль."
+        )
+        return ConversationHandler.END
+    #Create a keyboard with the car options
+    keyboard = [
+        [KeyboardButton(f"{make} {model} ({year}) - ID: {car_id}"]
+        for car_id, make, model, year in cars
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=TRUE, one_time_keyboard=True)
+
+    update.message.reply_text(
+        "Выберите автомобиль для которого хотите ввести пробег:", reply_markup=reply_markup
+    )
+    return SELECT_CAR_FOR_MILEAGE
+
+def select_car_for_mileage(update: Update, context: CallbackContext) -> int:
+    try:
+        #Extract the car_id from the selected text
+        selected_car = update.message.text
+        car_id = int(selected_car.split("ID: ")[1])
+        context.user_data["selected_car_id"] = car_id
+        update.message.reply_text("Введите текущий пробег вашего автомобиля:")
+        return INPUT_CURRENT_MILEAGE
+    except (ValueError, IndexError):
+        update.message.reply_text("Ошибка при выборе автомобиля. Пожалуйста, попробуйте еще раз."
+        )
+        return SELECT_CAR_FOR_MILEAGE
+
+def input_current_mileage(update: Update, context: CallbackContext) -> int:
+    car_id = context.user_data["selected_car_id"]
+    try:
+        mileage = int(update.message.text)
+
+        conn = mysql.connector.connect(
+            host=DATABASE_HOST,
+            user=DATABASE_USER,
+            password=DATABASE_PASSWORD,
+            database=DATABASE_NAME,
+        )
+        cursor = conn.cursor()
+
+        #Update car_mileage
+        cursor.execute(
+            "UPDATE cars SET mileage = %s WHERE car_id = %s", (mileage, car_id)
+        )
+
+        #Update last_mileage in maintenance table
+        cursor.execute(
+            "UPDATE maintenance SET last_mileage = %s WHERE car_id = %s", (mileage, car_id)
+        )
+        conn.commit()
+        conn.close()
+        update.message.reply_text(f"Пробег {mileage} км сохранен!")
+
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректный пробег (число).")
+        return INPUT_CURRENT_MILEAGE
+    return ConversationHandler.END
+
+# --- Команда /settimer (для администратора) ---
+def set_timer(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    if user_id != ADMINISTRATOR_ID:  # Замените на ID администратора
+        update.message.reply_text("У вас нет прав на эту команду.")
+        return ConversationHandler.END
+
+    update.message.reply_text("Введите интервал в секундах:")
+    return SET_TIMER
+
+
+# Обработка установки таймера
+def set_timer_interval(update: Update, context: CallbackContext) -> int:
+    global timer_interval
+    try:
+        timer_interval = int(update.message.text)
+        update.message.reply_text(f"Таймер установлен на {timer_interval} секунд.")
+        start_timer(context)
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректное число.")
+        return SET_TIMER
+
+    return ConversationHandler.END
+
+
+# Запуск таймера
+def start_timer(context: CallbackContext):
+    global timer_interval
+    if timer_interval:
+        threading.Timer(timer_interval, check_reminders, args=[context]).start()
+
+
+# Отправка напоминания
+def send_reminder(context: CallbackContext, user_id, message):
+    context.bot.send_message(chat_id=user_id, text=message)
+
+
+# --- Проверка необходимости напоминаний (запускается таймером) ---
+def check_reminders(context: CallbackContext):
+    conn = mysql.connector.connect(
+        host=DATABASE_HOST,
+        user=DATABASE_USER,
+        password=DATABASE_PASSWORD,
+        database=DATABASE_NAME,
+    )
+    cursor = conn.cursor()
+
+    # Проверка по пробегу
+    cursor.execute(
+        """
+        SELECT
+            u.user_id,
+            c.car_id,
+            c.mileage,
+            m.next_maintenance_mileage
+        FROM users u
+        JOIN cars c ON u.user_id = c.user_id
+        JOIN maintenance m ON c.car_id = m.car_id
+        WHERE m.next_maintenance_mileage IS NOT NULL
+    """
+    )
+    mileage_reminders = cursor.fetchall()
+
+    for user_id, car_id, current_mileage, next_mileage in mileage_reminders:
+        if current_mileage >= next_mileage:
+            message = (
+                "Напоминание о ТО! Ваш пробег достиг отметки. "
+                "Рекомендуем записаться на обслуживание."
+            )
+            send_reminder(context, user_id, message)
+
+    # Проверка по дате
+    cursor.execute(
+        """
+        SELECT
+            u.user_id,
+            c.car_id,
+            m.next_maintenance_date
+        FROM users u
+        JOIN cars c ON u.user_id = c.user_id
+        JOIN maintenance m ON c.car_id = m.car_id
+        WHERE m.next_maintenance_date IS NOT NULL
+    """
+    )
+    date_reminders = cursor.fetchall()
+
+    for user_id, car_id, next_date_str in date_reminders:
+        next_date = datetime.datetime.strptime(next_date_str, "%Y-%m-%d").date()
+        days_until = (next_date - datetime.date.today()).days
+
+        if 0 <= days_until <= 7:  # Напоминаем за неделю
+            message = (
+                f"Напоминание о ТО! Приближается дата {next_date_str}. "
+                "Рекомендуем записаться на обслуживание."
+            )
+            send_reminder(context, user_id, message)
+        elif days_until < 0:
+            message = (
+                f"Вы пропустили ТО! Дата {next_date_str} уже прошла. "
+                "Рекомендуем записаться на обслуживание."
+            )
+            send_reminder(context, user_id, message)
+
+    conn.close()
+    start_timer(context)  # Schedule the timer again
+
+# --- Административные функции ---
+def admin_menu(update: Update, context: CallbackContext) -> int:
+    user_id = update.message.from_user.id
+    if user_id != ADMINISTRATOR_ID:
+        update.message.reply_text("У вас нет прав на эту команду.")
+        return ConversationHandler.END
+
+    keyboard = [
+        [KeyboardButton("Список клиентов")],
+        [KeyboardButton("Установить ТО клиенту")],
+        [KeyboardButton("Список ремонтов")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+
+    update.message.reply_text("Админ-меню. Выберите действие:", reply_markup=reply_markup)
+    return ADMIN_MENU
+
+
+def admin_handle_menu_choice(update: Update, context: CallbackContext) -> int:
+    choice = update.message.text
+
+    if choice == "Список клиентов":
+        return admin_list_clients(update, context)
+    elif choice == "Установить ТО клиенту":
+        update.message.reply_text("Введите user_id клиента:")
+        return ADMIN_SELECT_CLIENT
+    elif choice == "Список ремонтов":
+        update.message.reply_text("Введите car_id автомобиля:")
+        return ADMIN_SET_CAR_ID
+    else:
+        update.message.reply_text("Неверный выбор.")
+        return ADMIN_MENU
+
+
+def admin_select_client(update: Update, context: CallbackContext) -> int:
+    try:
+        user_id = int(update.message.text)
+        context.user_data["selected_user_id"] = user_id
+
+        #Get the list of cars for the user
+        conn = mysql.connector.connect(
+          host=DATABASE_HOST,
+          user=DATABASE_USER,
+          password=DATABASE_PASSWORD,
+          database=DATABASE_NAME,
+        )
+        cursor = conn.cursor()
+        cursor.execute(
+          "SELECT car_id, make, model, year FROM cars WHERE user_id = %s", (user_id,)
+        )
+        cars = cursor.fetchall()
+        conn.close()
+
+        if not cars:
+          update.message.reply_text("У этого пользователя нет зарегистрированных автомобилей.")
+          return ADMIN_MENU
+
+        #Create a keyboard with the car options
+
+        keyboard = [
+          [KeyboardButton(f"{make}{model}({year})-ID:{car_id}")]
+          for car_id, make, model, year in cars
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        
+        update.message.reply_text("Выберите автомобиль для редактирования:", reply_markup=reply_markup)
+    
+        return ADMIN_SELECT_CAR
+
+        except ValueError:
+          update.message.reply_text("Пожалуйста, введите корректный user_id (число).")
+          return ADMIN_SELECT_CLIENT
+
+def admin_select_car(update: Update, context: CallbackContext) -> int:
+        try:
+          #Extract the car_id from the selected text
+          selected_car = update.message.text
+          car_id = int(selected_car.split("ID: ")[1])
+          context.user_data["selected_car_id"] = car_id
+
+        keyboard = [
+            [KeyboardButton("Установить ТО по пробегу")],
+            [KeyboardButton("Установить ТО по дате")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        update.message.reply_text(
+            "Выберите тип ТО:", reply_markup=reply_markup
+        )  # выбор следующего ТО, или "не знаю"
+        return ADMIN_MENU
+    except (ValueError, IndexError):
+        update.message.reply_text("Ошибка при выборе автомобиля. Пожалуйста, попробуйте еще раз.")
+        return ADMIN_SELECT_CAR
+
+
+def admin_set_next_maintenance_mileage(update: Update, context: CallbackContext) -> int:
+    car_id = context.user_data["selected_car_id"]
+    try:
+        mileage = int(update.message.text)
+        context.user_data["next_maintenance_mileage"] = mileage
+
+        conn = mysql.connector.connect(
+            host=DATABASE_HOST,
+            user=DATABASE_USER,
+            password=DATABASE_PASSWORD,
+            database=DATABASE_NAME,
+        )
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE maintenance
+            SET next_maintenance_mileage = %s, next_maintenance_date = NULL
+            WHERE car_id = %s
+        """,
+            (mileage, car_id),
+        )  # Clear date, set mileage
+
+        conn.commit()
+        conn.close()
+        update.message.reply_text(f"ТО по пробегу установлено на {mileage} км.")
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите корректный пробег (число).")
+        return ADMIN_SET_NEXT_MAINTENANCE_MILEAGE
+    return ConversationHandler.END
+
+
+def admin_set_next_maintenance_date(update: Update, context: CallbackContext) -> int:
+    car_id = context.user_data["selected_car_id"]
+    try:
+        date_str = update.message.text
+        date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        context.user_data["next_maintenance_date"] = str(date)
+
+        conn = mysql.connector.connect(
+            host=DATABASE_HOST,
+            user=DATABASE_USER,
+            password=DATABASE_PASSWORD,
+            database=DATABASE_NAME,
+        )
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE maintenance
+            SET next_maintenance_date = %s, next_maintenance_mileage = NULL
+            WHERE car_id = %s
+        """,
+            (str(date), car_id),
+        )  # Clear mileage, set date
+
+        conn.commit()
+        conn.close()
+
+        update.message.reply_text(f"ТО по дате установлено на {date_str}.")
+    except ValueError:
+        update.message.reply_text("Пожалуйста, введите дату в формате YYYY-MM-DD.")
+        return ADMIN_SET_NEXT_MAINTENANCE_DATE
+    return ConversationHandler.END
+
+
+# Отмена
+def cancel(update: Update, context: CallbackContext) -> int:
+    update.message.reply_text("Действие отменено.")
+    return ConversationHandler.END
+
+
+def main():
+    # Инициализация базы данных
+    init_db()
+
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # ConversationHandler для ввода числа
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            INPUT_NUMBER: [
+                MessageHandler(Filters.regex("Ввести число"), input_number),
+                MessageHandler(Filters.regex("Зарегистрировать автомобиль"), register_car),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler для регистрации автомобиля
+    register_handler = ConversationHandler(
+        entry_points=[MessageHandler(Filters.regex("Зарегистрировать автомобиль"), register_car)],
+        states={
+            REGISTER_CAR_MAKE: [
+                MessageHandler(Filters.text & ~Filters.command, register_car_make)
+            ],
+            REGISTER_CAR_MODEL: [
+                MessageHandler(Filters.text & ~Filters.command, register_car_model)
+            ],
+            REGISTER_CAR_YEAR: [
+                MessageHandler(Filters.text & ~Filters.command, register_car_year)
+            ],
+            REGISTER_CAR_VIN: [
+                MessageHandler(Filters.text & ~Filters.command, register_car_vin)
+            ],
+            REGISTER_LAST_MAINTENANCE_DATE: [
+                MessageHandler(
+                    Filters.text & ~Filters.command, register_last_maintenance_date
+                )
+            ],
+            REGISTER_NEXT_MILEAGE: [
+                MessageHandler(Filters.text & ~Filters.command, register_next_mileage)
+            ],
+            REGISTER_NEXT_DATE: [
+                MessageHandler(Filters.text & ~Filters.command, register_next_date)
+            ],
+            ADMIN_SET_NEXT_MAINTENANCE_MILEAGE: [
+                MessageHandler(
+                    Filters.text & ~Filters.command, admin_set_next_maintenance_mileage
+                )
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler для установки таймера
+    timer_handler = ConversationHandler(
+        entry_points=[CommandHandler("settimer", set_timer)],
+        states={
+            SET_TIMER: [
+                MessageHandler(Filters.text & ~Filters.command, set_timer_interval)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler для ввода пробега
+    mileage_handler = ConversationHandler(
+        entry_points=[CommandHandler("current_mileage", current_mileage)],
+        states={
+            SELECT_CAR_FOR_MILEAGE: [
+                MessageHandler(Filters.text & ~Filters.command, select_car_for_mileage)
+            ],
+            INPUT_CURRENT_MILEAGE: [
+                MessageHandler(Filters.text & ~Filters.command, input_current_mileage)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    # ConversationHandler для админ-меню
+    admin_handler = ConversationHandler(
+    entry_points=[CommandHandler("admin", admin_menu)],
+    states={
+        ADMIN_MENU: [
+             MessageHandler(Filters.regex("^(Список клиентов|Установить ТО клиенту|Список ремонтов)$"), admin_handle_menu_choice),
+        ],
+        ADMIN_LIST_CLIENTS: [
+            MessageHandler(Filters.text & ~Filters.command, admin_list_clients)
+        ],
+        ADMIN_SET_NEXT_MAINTENANCE_MILEAGE: [
+             MessageHandler(Filters.text & ~Filters.command, admin_set_next_maintenance_mileage)
+        ],
+        ADMIN_SET_NEXT_MAINTENANCE_DATE: [
+             MessageHandler(Filters.text & ~Filters.command, admin_set_next_maintenance_date)
+        ],
+        ADMIN_SELECT_CLIENT: [
+            MessageHandler(Filters.text & ~Filters.command, admin_select_client)
+        ],
+        ADMIN_SELECT_CAR: [
+            MessageHandler(Filters.text & ~Filters.command, admin_select_car)
+        ],
+        ADMIN_SET_CAR_ID: [
+             MessageHandler(Filters.text & ~Filters.command, admin_set_car_id)
+        ],
+        ADMIN_SHOW_REPAIRS: [
+             MessageHandler(Filters.text & ~Filters.command, admin_show_repairs)
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+    dp.add_handler(conv_handler)
+    dp.add_handler(register_handler)
+    dp.add_handler(timer_handler)
+    dp.add_handler(mileage_handler)
+    dp.add_handler(admin_handler)
+
+    # Запускаем проверку напоминаний при старте бота
+    updater.job_queue.run_once(check_reminders, 0) #запускаем сразу
+
+    updater.start_polling()
+    updater.idle()
+
+
+if __name__ == "__main__":
+    main()
+
